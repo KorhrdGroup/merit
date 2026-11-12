@@ -1,0 +1,374 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { supabaseAdmin } from '@/lib/supabase/server';
+import { sendConsultationEmail } from '@/lib/email';
+import { sendAlimtalk, sendAdminNewInquiryAlimtalk } from '@/lib/kakao';
+import { formatClickSource as formatClickSourceStatic } from '@/lib/cafe-names';
+import { sendMetaLeadEvent } from '@/lib/meta-capi';
+import { sanitizeClickKey, sendAdisonPostback } from '@/lib/adison-postback';
+
+// 숫자만 있는 번호를 010-1234-5678 형태로 (중복 조회용 변형값)
+function formatPhoneHyphen(digits: string): string {
+  if (digits.length === 11) return `${digits.slice(0, 3)}-${digits.slice(3, 7)}-${digits.slice(7)}`;
+  if (digits.length === 10) return `${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`;
+  return digits;
+}
+
+async function formatClickSourceFromDB(clickSource: string | null): Promise<string> {
+  if (!clickSource) return '미입력';
+  // 랜딩페이지 형식은 그대로 반환
+  if (clickSource.startsWith('랜딩페이지')) return clickSource;
+  try {
+    const { data } = await supabaseAdmin.from('channels').select('id, name');
+    const map: Record<string, string> = Object.fromEntries((data || []).map((c: { id: string; name: string }) => [c.id, c.name]));
+    const stripped = clickSource.startsWith('바로폼_') ? clickSource.slice(4) : clickSource;
+    const idx = stripped.indexOf('_');
+    if (idx === -1) return stripped;
+    const major = stripped.slice(0, idx);
+    const rawMinor = stripped.slice(idx + 1);
+    const minor = map[rawMinor] || rawMinor;
+    return `${major} > ${minor}`;
+  } catch {
+    return formatClickSourceStatic(clickSource);
+  }
+}
+
+// Vercel Serverless 함수 타임아웃 설정 (초 단위)
+export const maxDuration = 90;
+
+// 이 프로젝트는 국가유공자 상담 폼의 접수 저장(POST)만 제공한다.
+// 조회·수정·삭제(GET·PATCH·DELETE)는 오피스에서 처리하므로 두지 않는다.
+
+// POST: 상담 신청 저장
+export async function POST(request: NextRequest) {
+  try {
+    // 환경 변수 확인
+    if (
+      !process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      !process.env.SUPABASE_SERVICE_ROLE_KEY
+    ) {
+      return NextResponse.json(
+        { error: 'Supabase configuration missing' },
+        { status: 500 }
+      );
+    }
+
+    const body = await request.json();
+    const { name, contact, education, hope_course, reason, click_source, is_manual_entry, residence, memo, counsel_check, status, subject_cost, manager, fast_consultation, preferred_times, consult_time_memo, event_id, fbp, fbc, event_source_url, click_key } = body;
+
+    // 유효성 검사 - 이름과 연락처만 필수
+    if (!name || !contact) {
+      return NextResponse.json(
+        { error: 'Name and contact are required' },
+        { status: 400 }
+      );
+    }
+
+    // 엔비티 리워드 광고 click_key (수동 추가 제외, 최대 255자)
+    const clickKey = is_manual_entry ? null : sanitizeClickKey(click_key);
+
+    // 중복 방지: 휴대폰번호 기준 포스트백은 최초 1회만 발송한다.
+    // 동일 번호로 재신청 시 리드는 저장하되 포스트백은 보내지 않는다 (중복 발송 = 리워드 다중 지급, 보상 불가).
+    let shouldSendPostback = false;
+    if (clickKey) {
+      const digits = String(contact).replace(/[^0-9]/g, '');
+      const variants = Array.from(
+        new Set([String(contact), digits, formatPhoneHyphen(digits)].filter(Boolean))
+      );
+      const { count, error: dupError } = await supabaseAdmin
+        .from('hakjeom_consultations')
+        .select('id', { count: 'exact', head: true })
+        .in('contact', variants)
+        .not('postback_sent_at', 'is', null);
+      if (dupError) {
+        // 조회 실패 시 안전하게 미발송 (오발송도 전부 과금되므로)
+        console.error('[ADISON] 중복 조회 실패 — 포스트백 미발송', dupError);
+      } else if ((count ?? 0) > 0) {
+        console.log('[ADISON] 동일 번호 포스트백 이력 있음 — 미발송');
+      } else {
+        shouldSendPostback = true;
+      }
+    }
+
+    // Meta 전환 API용 브라우저 식별값 — 오피스가 나중에 보내는 Contact·Purchase 이벤트를
+    // 이 Lead 와 같은 사람으로 매칭시키려면 저장해 두어야 한다. (연동 요청서 2판 3-1)
+    const clientIp =
+      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+      request.headers.get('x-real-ip') ||
+      undefined;
+    const clientUserAgent = request.headers.get('user-agent') || undefined;
+
+    // Supabase에 데이터 저장
+    const { data, error } = await supabaseAdmin
+      .from('hakjeom_consultations')
+      .insert([
+        {
+          name,
+          contact,
+          // 수동 추가 리드는 실제 브라우저 유입이 아니므로 식별값을 남기지 않는다.
+          ...(is_manual_entry
+            ? {}
+            : {
+                fbp: fbp || null,
+                fbc: fbc || null,
+                client_ip: clientIp || null,
+                user_agent: clientUserAgent || null,
+              }),
+          // 컬럼 추가(hakjeom_consultations_adison_postback.sql) 전에도 일반 유입 저장이 깨지지 않도록 값이 있을 때만 포함
+          ...(clickKey ? { click_key: clickKey } : {}),
+          education: education || null,
+          hope_course: hope_course || null,
+          reason: reason || null,
+          click_source: click_source || null,
+          residence: residence || null,
+          memo: memo || null,
+          counsel_check: counsel_check || null,
+          subject_cost: subject_cost ? parseInt(String(subject_cost).replace(/,/g, '')) || null : null,
+          manager: manager || null,
+          status: status || '상담대기',
+          fast_consultation: !!fast_consultation,
+          preferred_times: Array.isArray(preferred_times) && preferred_times.length ? preferred_times : null,
+          consult_time_memo: consult_time_memo || null,
+        },
+      ])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error saving consultation:', error);
+      return NextResponse.json(
+        { error: 'Failed to save consultation' },
+        { status: 500 }
+      );
+    }
+
+    // 엔비티 AdiSON 포스트백 발송 (click_key 있는 리워드 유입만, 번호당 1회, 실패해도 상담 신청은 성공 처리, 재시도 없음)
+    if (shouldSendPostback && clickKey) {
+      // 발송 시도 시점을 먼저 기록해 동시 제출로 인한 이중 발송 가능성을 줄인다.
+      const sentAt = new Date().toISOString();
+      await supabaseAdmin
+        .from('hakjeom_consultations')
+        .update({ postback_sent_at: sentAt, postback_status: 'sending' })
+        .eq('id', data.id);
+      const result = await sendAdisonPostback(clickKey);
+      const { error: pbError } = await supabaseAdmin
+        .from('hakjeom_consultations')
+        .update({ postback_status: result.status })
+        .eq('id', data.id);
+      if (pbError) console.error('[ADISON] 응답코드 저장 실패', pbError);
+    }
+
+    // Meta Conversions API - Lead 이벤트 서버 전송 (수동 추가 제외, 실패해도 상담 신청은 성공 처리)
+    if (!is_manual_entry) {
+      await sendMetaLeadEvent({
+        eventId: event_id || null,
+        eventSourceUrl: event_source_url || request.headers.get('referer') || null,
+        name,
+        phone: contact,
+        clientIp,
+        clientUserAgent,
+        fbp: fbp || null,
+        fbc: fbc || null,
+        // 오피스의 Contact·Purchase 이벤트와 묶이도록 리드 ID를 external_id 로 함께 보낸다.
+        leadId: data.id,
+      });
+    }
+
+    // 이메일 알림 전송 (비동기, 실패해도 상담 신청은 성공 처리)
+    // 수동 추가가 아닐 때만 이메일 전송
+    if (!is_manual_entry) {
+      console.log('[EMAIL] 이메일 전송 시도 시작');
+      console.log('[EMAIL] 환경 변수 확인:');
+      console.log(
+        '[EMAIL] - BREVO_SMTP_LOGIN 존재:',
+        !!process.env.BREVO_SMTP_LOGIN
+      );
+    console.log(
+      '[EMAIL] - BREVO_SMTP_LOGIN 값:',
+      process.env.BREVO_SMTP_LOGIN
+        ? `${process.env.BREVO_SMTP_LOGIN.substring(0, 3)}***`
+        : '없음'
+    );
+    console.log('[EMAIL] - BREVO_SMTP_KEY 존재:', !!process.env.BREVO_SMTP_KEY);
+    console.log(
+      '[EMAIL] - BREVO_SMTP_KEY 길이:',
+      process.env.BREVO_SMTP_KEY ? process.env.BREVO_SMTP_KEY.length : 0
+    );
+    console.log(
+      '[EMAIL] - CONSULTATION_EMAIL:',
+      process.env.CONSULTATION_EMAIL || '없음'
+    );
+    console.log(
+      '[EMAIL] - BREVO_FROM_EMAIL:',
+      process.env.BREVO_FROM_EMAIL || '없음'
+    );
+    console.log(
+      '[EMAIL] - BREVO_FROM_NAME:',
+      process.env.BREVO_FROM_NAME || '없음'
+    );
+
+    // Brevo 환경 변수 확인
+    if (process.env.BREVO_SMTP_LOGIN && process.env.BREVO_SMTP_KEY) {
+      console.log('[EMAIL] 이메일 전송 함수 호출');
+      // await로 기다려서 Serverless 함수가 종료되기 전에 이메일 전송 완료
+      try {
+        const emailResult = await sendConsultationEmail({
+          name,
+          contact,
+          education,
+          hope_course: hope_course || null,
+          reason,
+          click_source: click_source || null,
+        });
+        console.log(
+          '[EMAIL] 이메일 전송 결과:',
+          JSON.stringify(emailResult, null, 2)
+        );
+      } catch (emailError: unknown) {
+        // 이메일 전송 실패해도 상담 신청은 성공 처리
+        console.error('[EMAIL] 이메일 전송 실패:');
+        console.error(
+          '[EMAIL] 에러 타입:',
+          emailError instanceof Error
+            ? emailError.constructor.name
+            : typeof emailError
+        );
+        console.error(
+          '[EMAIL] 에러 메시지:',
+          emailError instanceof Error ? emailError.message : String(emailError)
+        );
+        console.error(
+          '[EMAIL] 에러 스택:',
+          emailError instanceof Error ? emailError.stack : '스택 없음'
+        );
+        console.error(
+          '[EMAIL] 전체 에러 객체:',
+          JSON.stringify(emailError, Object.getOwnPropertyNames(emailError), 2)
+        );
+      }
+    } else {
+      console.warn(
+        '[EMAIL] Brevo 환경 변수가 설정되지 않아 이메일 전송을 건너뜁니다'
+      );
+      console.warn(
+        '[EMAIL] 필요한 환경 변수: BREVO_SMTP_LOGIN, BREVO_SMTP_KEY'
+      );
+    }
+    } else {
+      console.log('[EMAIL] 수동 추가로 이메일 전송을 건너뜁니다.');
+    }
+
+    // Slack 알림 전송 (수동 추가 포함)
+    if (process.env.SLACK_WEBHOOK_URL) {
+      console.log('[SLACK] Slack 알림 전송 시도');
+      try {
+        const slackMessage = {
+          text: is_manual_entry 
+            ? '🆕 *관리자가 새로운 상담 신청을 추가했습니다*'
+            : '📝 *새로운 상담 신청이 접수되었습니다*',
+          blocks: [
+            {
+              type: 'header',
+              text: {
+                type: 'plain_text',
+                text: is_manual_entry 
+                  ? '🆕 관리자 추가 상담 신청'
+                  : '📝 새로운 상담 신청',
+              },
+            },
+            {
+              type: 'section',
+              fields: [
+                {
+                  type: 'mrkdwn',
+                  text: `*이름:*\n${name}`,
+                },
+                {
+                  type: 'mrkdwn',
+                  text: `*연락처:*\n${contact}`,
+                },
+                {
+                  type: 'mrkdwn',
+                  text: `*학력:*\n${education || '미입력'}`,
+                },
+                {
+                  type: 'mrkdwn',
+                  text: `*희망과정:*\n${hope_course || '미입력'}`,
+                },
+                {
+                  type: 'mrkdwn',
+                  text: `*유입경로:*\n${await formatClickSourceFromDB(click_source)}`,
+                },
+              ],
+            },
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: `*상담 이유:*\n${reason || '미입력'}`,
+              },
+            },
+            {
+              type: 'context',
+              elements: [
+                {
+                  type: 'mrkdwn',
+                  text: `접수 시간: ${new Date().toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}`,
+                },
+              ],
+            },
+          ],
+        };
+
+        const slackResponse = await fetch(process.env.SLACK_WEBHOOK_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(slackMessage),
+        });
+
+        if (slackResponse.ok) {
+          console.log('[SLACK] Slack 알림 전송 성공');
+        } else {
+          console.error('[SLACK] Slack 알림 전송 실패:', await slackResponse.text());
+        }
+      } catch (slackError) {
+        console.error('[SLACK] Slack 알림 전송 중 오류:', slackError);
+      }
+    } else {
+      console.warn('[SLACK] SLACK_WEBHOOK_URL이 설정되지 않아 Slack 알림을 건너뜁니다');
+    }
+
+    // 카카오 알림톡 전송 (신청자에게, 수동 추가 제외)
+    if (!is_manual_entry) {
+      console.log('[KAKAO] 카카오 알림톡 전송 시도');
+      try {
+        const kakaoResult = await sendAlimtalk({
+          contact,
+        });
+        if (kakaoResult.success) {
+          console.log('[KAKAO] ✅ 알림톡 전송 성공');
+        } else {
+          console.warn('[KAKAO] ⚠️ 알림톡 전송 실패:', kakaoResult.error);
+        }
+      } catch (kakaoError) {
+        console.error('[KAKAO] 알림톡 전송 중 오류:', kakaoError);
+      }
+      // 관리자 신규 문의 알림톡
+      await sendAdminNewInquiryAlimtalk(name)
+    } else {
+      console.log('[KAKAO] 수동 추가로 알림톡 전송을 건너뜁니다.');
+    }
+
+    return NextResponse.json(
+      { message: 'Consultation request submitted successfully', data },
+      { status: 201 }
+    );
+  } catch (error) {
+    console.error('Error saving consultation:', error);
+    return NextResponse.json(
+      { error: 'Failed to save consultation' },
+      { status: 500 }
+    );
+  }
+}
